@@ -1,0 +1,84 @@
+name: enva CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Rust quality gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout enva
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Prepare evidence directory
+        run: mkdir -p ci-artifacts
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check 2>&1 | tee ci-artifacts/cargo-fmt.log
+
+      - name: Run Clippy with warnings denied
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings 2>&1 | tee ci-artifacts/cargo-clippy.log
+
+      - name: Run test suite
+        run: cargo test --locked 2>&1 | tee ci-artifacts/cargo-test.log
+
+      - name: Build enva release binary
+        run: cargo build --release --locked --bin enva 2>&1 | tee ci-artifacts/cargo-build.log
+
+      - name: Verify CLI surface
+        run: |
+          set -euo pipefail
+          ./target/release/enva --version | tee ci-artifacts/enva-version.txt
+          ./target/release/enva --help | tee ci-artifacts/enva-help.txt
+          ./target/release/enva list --help | tee ci-artifacts/enva-list-help.txt
+
+      - name: Upload enva quality evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: enva-quality-evidence
+          path: ci-artifacts/
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Job summary
+        if: always()
+        continue-on-error: true
+        run: |
+          # Every check below is a boolean gate with no numeric comparison, so the Result column
+          # carries the job verdict: green means all preceding steps passed.
+          if [ "${{ job.status }}" = "success" ]; then gate_result="PASS"; else gate_result="-"; fi
+          bash scripts/ci/job-summary.sh \
+            --verdict "${{ job.status }}" \
+            --title "enva — quality gate" \
+            --checked "Formatting, Clippy with warnings denied, the full test suite, a release build, and a smoke check of the CLI surface." \
+            --check "cargo fmt --check|no diffs|cargo fmt --check|${gate_result}" \
+            --check "cargo clippy -D warnings|no warnings|see step log|${gate_result}" \
+            --check "Test suite|all tests pass|see step log|${gate_result}" \
+            --check "Release build|binary builds|see step log|${gate_result}" \
+            --check "CLI surface|--version, --help, list --help respond|see step log|${gate_result}" \
+            --artifact "enva-quality-evidence" \
+            --limit "Static quality gate. Real package-manager interaction and per-environment solvability are covered by the E2E matrix, not here."

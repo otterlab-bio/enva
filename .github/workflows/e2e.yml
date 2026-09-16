@@ -1,0 +1,533 @@
+name: Enva E2E
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: E2E ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: otter-core
+            yaml: src/configs/otter-core.yaml
+            env_name: otter-core-ci
+            probe: "samtools --version | head -n 1"
+            install_spec_primary: "conda-forge::jq"
+            install_spec_secondary: "bioconda::seqtk"
+            install_verify: 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"'
+          - label: otter-snakemake
+            yaml: src/configs/otter-snakemake.yaml
+            env_name: otter-snakemake-ci
+            probe: "snakemake --version"
+            install_spec_primary: "conda-forge::jq"
+            install_spec_secondary: "bioconda::seqtk"
+            install_verify: 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"'
+          - label: otter-extra
+            yaml: src/configs/otter-extra.yaml
+            env_name: otter-extra-ci
+            probe: "bedtools --version"
+            install_spec_primary: "conda-forge::jq"
+            install_spec_secondary: "bioconda::seqtk"
+            install_verify: 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"'
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build enva
+        run: cargo build --release --bin enva
+
+      - name: Create environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          mkdir -p ci-logs "$RATTLER_CACHE_DIR"
+          ./target/release/enva create \
+            --yaml "${{ matrix.yaml }}" \
+            --name "${{ matrix.env_name }}" \
+            --force \
+            --clean-cache \
+            --output summary \
+            2>&1 | tee "ci-logs/${{ matrix.label }}-create.log"
+
+      - name: Verify environment discovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva list --detailed \
+            2>&1 | tee "ci-logs/${{ matrix.label }}-list.log"
+          grep -q "${{ matrix.env_name }}" "ci-logs/${{ matrix.label }}-list.log"
+
+      - name: Validate environment registration
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva validate --name "${{ matrix.env_name }}" \
+            2>&1 | tee "ci-logs/${{ matrix.label }}-validate.log"
+
+      - name: Install multiple mixed-source packages into environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva install --name "${{ matrix.env_name }}" \
+            "${{ matrix.install_spec_primary }}" \
+            "${{ matrix.install_spec_secondary }}" \
+            2>&1 | tee "ci-logs/${{ matrix.label }}-install.log"
+
+      - name: Run smoke command inside environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva run \
+            --name "${{ matrix.env_name }}" \
+            --command "${{ matrix.probe }}" \
+            2>&1 | tee "ci-logs/${{ matrix.label }}-run.log"
+
+      - name: Verify installed mixed-source packages inside environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva run \
+            --name "${{ matrix.env_name }}" \
+            --command '${{ matrix.install_verify }}' \
+            2>&1 | tee "ci-logs/${{ matrix.label }}-install-verify.log"
+
+      - name: Remove rattler-managed environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva remove "${{ matrix.env_name }}" \
+            2>&1 | tee "ci-logs/${{ matrix.label }}-remove.log"
+          if ./target/release/enva validate --name "${{ matrix.env_name }}" \
+            > "ci-logs/${{ matrix.label }}-post-remove-validate.log" 2>&1; then
+            echo "Expected environment ${{ matrix.env_name }} to be absent after removal" >&2
+            cat "ci-logs/${{ matrix.label }}-post-remove-validate.log" >&2
+            exit 1
+          fi
+
+      - name: Upload e2e logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: enva-e2e-${{ matrix.label }}-logs
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Job summary
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then gate_result="PASS"; else gate_result="-"; fi
+          bash scripts/ci/job-summary.sh \
+            --verdict "${{ job.status }}" \
+            --title "enva — end-to-end environment lifecycle" \
+            --scope "${{ matrix.label }}" \
+            --checked "Creates the shipped environment definition from its committed YAML, verifies discovery and registration, installs extra packages from two channels, runs a smoke command, verifies the installed packages, then removes the environment." \
+            --check "Environment created from committed YAML|create succeeds|see step log|${gate_result}" \
+            --check "Discovery and registration|enva lists and validates the environment|see step log|${gate_result}" \
+            --check "Mixed-source install|conda-forge and bioconda specs install|see step log|${gate_result}" \
+            --check "Smoke command inside environment|declared probe responds|see step log|${gate_result}" \
+            --check "Removal|enva remove succeeds|see step log|${gate_result}" \
+            --metric "Environment definition|${{ matrix.yaml }}" \
+            --limit "These rows are pass/fail gates with no numeric comparison, so the Result column carries the job verdict and the Observed column points at the step log." \
+            --artifact "enva-e2e-${{ matrix.label }}-logs" \
+            --limit "Lifecycle coverage for this one environment definition. It asserts that the pinned YAML solves and installs; it does not measure scientific correctness of the tools inside." \
+            --note "This is the job that catches an unsolvable environment definition, which a structural dry run cannot detect."
+
+  # This job intentionally installs external conda/mamba/micromamba to exercise enva's
+  # advertised compatibility backend (ENVA_BACKEND=cli). It is an enva feature test, not
+  # a scientific analysis pipeline; OTTER scientific workflows use enva only.
+  compatibility-backend-smoke:
+    name: Compatibility smoke (${{ matrix.manager }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        manager: [micromamba, mamba, conda]
+    env:
+      CARGO_TERM_COLOR: always
+      ENVA_BACKEND: cli
+      ENVA_PACKAGE_MANAGER: ${{ matrix.manager }}
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up micromamba
+        if: matrix.manager == 'micromamba'
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          generate-run-shell: false
+
+      - name: Set up mamba
+        if: matrix.manager == 'mamba'
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          mamba-version: "*"
+          channels: conda-forge
+          channel-priority: strict
+          activate-environment: ""
+          auto-activate-base: false
+
+      - name: Set up conda
+        if: matrix.manager == 'conda'
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniconda-version: latest
+          activate-environment: ""
+          auto-activate-base: false
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Exercise installed compatibility backend
+        shell: bash -el {0}
+        run: |
+          set -euo pipefail
+          manager="${{ matrix.manager }}"
+          environment_name="enva-${manager}-compat-ci"
+          mkdir -p ci-logs
+          "$manager" --version | tee "ci-logs/${manager}-version.log"
+          cat > "${RUNNER_TEMP}/compat-environment.yaml" <<'YAML'
+          channels:
+            - conda-forge
+          dependencies:
+            - python=3.11
+          YAML
+          cargo build --release --bin enva
+          ./target/release/enva create \
+            --yaml "${RUNNER_TEMP}/compat-environment.yaml" \
+            --name "$environment_name" \
+            --force \
+            --output summary \
+            2>&1 | tee "ci-logs/${manager}-create.log"
+          ./target/release/enva list --detailed \
+            2>&1 | tee "ci-logs/${manager}-list.log"
+          grep -q "$environment_name" "ci-logs/${manager}-list.log"
+          ./target/release/enva install --name "$environment_name" conda-forge::jq \
+            2>&1 | tee "ci-logs/${manager}-install.log"
+          ./target/release/enva run \
+            --name "$environment_name" \
+            --command 'python -c "import sys; print(sys.prefix)" && jq --version' \
+            2>&1 | tee "ci-logs/${manager}-run.log"
+          ./target/release/enva remove "$environment_name" \
+            2>&1 | tee "ci-logs/${manager}-remove.log"
+          if ./target/release/enva list --detailed | grep -q "$environment_name"; then
+            echo "Compatibility backend still reports $environment_name after removal" >&2
+            exit 1
+          fi
+
+      - name: Upload compatibility smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: enva-compat-${{ matrix.manager }}-logs
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Job summary
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then gate_result="PASS"; else gate_result="-"; fi
+          bash scripts/ci/job-summary.sh \
+            --verdict "${{ job.status }}" \
+            --title "enva — compatibility backend smoke" \
+            --scope "${{ matrix.manager }}" \
+            --checked "Drives enva through an external package manager instead of the bundled rattler path (ENVA_BACKEND=cli): creates an environment, lists it, installs a package, runs a command inside it, and removes it." \
+            --check "External manager detected|enva selects ${{ matrix.manager }}|see step log|${gate_result}" \
+            --check "Create, list, install, run, remove|all operations succeed|see step log|${gate_result}" \
+            --check "Removal is complete|environment absent afterwards|see step log|${gate_result}" \
+            --metric "Backend|ENVA_BACKEND=cli with ENVA_PACKAGE_MANAGER=${{ matrix.manager }}" \
+            --limit "These rows are pass/fail gates with no numeric comparison, so the Result column carries the job verdict and the Observed column points at the step log." \
+            --artifact "enva-compat-${{ matrix.manager }}-logs" \
+            --limit "A compatibility-path feature test that deliberately uses an external manager. OTTER scientific workflows use the bundled path, so this job is not evidence about the scientific environments themselves." \
+            --note "This job exists so the historical compatibility layer cannot silently rot while the bundled backend is the primary path."
+
+  # This job intentionally installs external micromamba to create a foreign prefix and
+  # exercise enva's advertised `adopt` capability. It is an enva feature test, not a
+  # scientific analysis pipeline; OTTER scientific workflows use enva only.
+  adopt-e2e:
+    name: E2E adopt-helper-path
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      ENVA_PACKAGE_MANAGER: micromamba
+      ENVA_RATTLER_ROOT_PREFIX: /tmp/enva-adopt-rattler-root
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up micromamba
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          generate-run-shell: false
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build enva
+        run: cargo build --release --bin enva
+
+      - name: Create foreign micromamba environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-logs
+          micromamba create -y -n enva-adopt-ci -c conda-forge python=3.11 \
+            2>&1 | tee "ci-logs/adopt-create-foreign.log"
+          micromamba env list \
+            2>&1 | tee "ci-logs/adopt-micromamba-list-before.log"
+          grep -q "enva-adopt-ci" "ci-logs/adopt-micromamba-list-before.log"
+
+      - name: Adopt foreign environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva adopt --name enva-adopt-ci \
+            2>&1 | tee "ci-logs/adopt-command.log"
+
+      - name: Verify adopted environment discovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva list --detailed \
+            2>&1 | tee "ci-logs/adopt-list.log"
+          grep -E "enva-adopt-ci.*rattler.*micromamba.*micromamba" "ci-logs/adopt-list.log"
+
+      - name: Validate adopted environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva validate --name enva-adopt-ci \
+            2>&1 | tee "ci-logs/adopt-validate.log"
+
+      - name: Install multiple mixed-source packages into adopted environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva install --name enva-adopt-ci \
+            conda-forge::jq bioconda::seqtk \
+            2>&1 | tee "ci-logs/adopt-install.log"
+
+      - name: Run smoke commands inside adopted environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva run \
+            --name enva-adopt-ci \
+            --command "python --version" \
+            2>&1 | tee "ci-logs/adopt-run-python.log"
+          ./target/release/enva run \
+            --name enva-adopt-ci \
+            --command 'test -x "$CONDA_PREFIX/bin/jq" && "$CONDA_PREFIX/bin/jq" --version && test -x "$CONDA_PREFIX/bin/seqtk"' \
+            2>&1 | tee "ci-logs/adopt-run-install-verify.log"
+
+      - name: Remove adopted environment via helper manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache"
+          ./target/release/enva remove enva-adopt-ci \
+            2>&1 | tee "ci-logs/adopt-remove.log"
+          if ./target/release/enva validate --name enva-adopt-ci \
+            > "ci-logs/adopt-post-remove-validate.log" 2>&1; then
+            echo "Expected adopted environment enva-adopt-ci to be absent after removal" >&2
+            cat "ci-logs/adopt-post-remove-validate.log" >&2
+            exit 1
+          fi
+          if micromamba env list > "ci-logs/adopt-micromamba-list-after.log" 2>&1; then
+            if grep -q "enva-adopt-ci" "ci-logs/adopt-micromamba-list-after.log"; then
+              echo "Micromamba still reports enva-adopt-ci after enva remove" >&2
+              cat "ci-logs/adopt-micromamba-list-after.log" >&2
+              exit 1
+            fi
+          else
+            cat "ci-logs/adopt-micromamba-list-after.log" >&2
+            exit 1
+          fi
+
+      - name: Upload adopt e2e logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: enva-e2e-adopt-logs
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Job summary
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then gate_result="PASS"; else gate_result="-"; fi
+          bash scripts/ci/job-summary.sh \
+            --verdict "${{ job.status }}" \
+            --title "enva — adopt foreign environment" \
+            --scope "micromamba-created prefix" \
+            --checked "Creates an environment outside enva with micromamba, then adopts it through enva and exercises the full lifecycle on the adopted prefix: discovery, validation, mixed-source install, smoke command, and removal through the helper manager." \
+            --check "Foreign environment created externally|micromamba reports it|see step log|${gate_result}" \
+            --check "Adoption|enva recognizes and adopts the prefix|see step log|${gate_result}" \
+            --check "Lifecycle on adopted prefix|list, validate, install, run succeed|see step log|${gate_result}" \
+            --check "Removal via helper manager|environment removed|see step log|${gate_result}" \
+            --metric "Helper manager|micromamba" \
+            --limit "These rows are pass/fail gates with no numeric comparison, so the Result column carries the job verdict and the Observed column points at the step log." \
+            --artifact "enva-e2e-adopt-logs" \
+            --limit "Adoption is a compatibility capability for pre-existing prefixes. It does not assert that arbitrary foreign environments are reproducible from their own history." \
+            --note "This is the path a user hits when migrating an existing conda installation, so it is tested rather than assumed."
+
+  root-priority-e2e:
+    name: E2E active-root-precedence
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build enva
+        run: cargo build --release --bin enva
+
+      - name: Verify active conda root wins for same-name replacement
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-logs
+
+          export HOME="${RUNNER_TEMP:-/tmp}/enva-root-priority-home"
+          export CONDA_PREFIX="${RUNNER_TEMP:-/tmp}/zz-active-conda-root"
+          export RATTLER_CACHE_DIR="${RUNNER_TEMP:-/tmp}/rattler-cache-root-priority"
+          mkdir -p "$HOME/.conda" "$RATTLER_CACHE_DIR"
+          mkdir -p "$CONDA_PREFIX/conda-meta" "$CONDA_PREFIX/envs/root-priority-ci/conda-meta"
+          printf '%s\n' base-history > "$CONDA_PREFIX/conda-meta/history"
+          printf '%s\n' old-env-history > "$CONDA_PREFIX/envs/root-priority-ci/conda-meta/history"
+
+          cat > root-priority-ci.yaml <<'YAML'
+          name: root-priority-ci
+          channels:
+            - conda-forge
+          dependencies:
+            - python=3.11
+            - pip
+          YAML
+
+          ./target/release/enva create \
+            --yaml root-priority-ci.yaml \
+            --name root-priority-ci \
+            --force \
+            --clean-cache \
+            --output summary \
+            2>&1 | tee "ci-logs/root-priority-create.log"
+
+          if grep -q "already exists in other rattler-owned prefixes" "ci-logs/root-priority-create.log"; then
+            echo "Active conda root was not preferred during replacement" >&2
+            cat "ci-logs/root-priority-create.log" >&2
+            exit 1
+          fi
+
+          ./target/release/enva list --detailed \
+            2>&1 | tee "ci-logs/root-priority-list.log"
+          grep -q "$CONDA_PREFIX/envs/root-priority-ci" "ci-logs/root-priority-list.log"
+
+          expected_prefix="$CONDA_PREFIX/envs/root-priority-ci"
+          ./target/release/enva run \
+            --name root-priority-ci \
+            --command "test \"\$CONDA_PREFIX\" = \"$expected_prefix\" && python --version" \
+            2>&1 | tee "ci-logs/root-priority-run.log"
+
+          ./target/release/enva remove root-priority-ci \
+            2>&1 | tee "ci-logs/root-priority-remove.log"
+          if [ -d "$CONDA_PREFIX/envs/root-priority-ci" ]; then
+            echo "Expected root-priority-ci to be removed from active conda root" >&2
+            exit 1
+          fi
+
+      - name: Upload root-priority logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: enva-e2e-root-priority-logs
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Job summary
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then gate_result="PASS"; else gate_result="-"; fi
+          bash scripts/ci/job-summary.sh \
+            --verdict "${{ job.status }}" \
+            --title "enva — active root precedence" \
+            --scope "same-name replacement" \
+            --checked "Creates an environment under the active conda root and asserts that the active root wins when the same environment name exists elsewhere, so enva never silently operates on a different prefix than the user's active one." \
+            --check "Active root wins for a same-name environment|enva resolves to the active root|see step log|${gate_result}" \
+            --check "Replacement is deterministic|no cross-root ambiguity|see step log|${gate_result}" \
+            --metric "Precedence rule|active conda root over other roots" \
+            --limit "These rows are pass/fail gates with no numeric comparison, so the Result column carries the job verdict and the Observed column points at the step log." \
+            --artifact "enva-e2e-root-priority-logs" \
+            --limit "A path-resolution invariant for a specific conflict case. It is not a general claim about every multi-root configuration a user might have." \
+            --note "This guards against the most dangerous class of environment bug: acting on the wrong prefix when two installs share a name."
