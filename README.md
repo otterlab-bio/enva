@@ -76,6 +76,33 @@ enva deactivate
 
 Equivalent one-shot activation is available through `eval "$(enva activate otter-core)"`. Fish and PowerShell hooks are also supported.
 
+## CLI reference
+
+Global options precede the subcommand:
+
+```text
+enva [--verbose|-v] [--quiet|-q] [--log|-l PATH] [--dry-run] [--json] <COMMAND>
+```
+
+| Option | Effect |
+| --- | --- |
+| `--verbose, -v` | Debug-level logging. |
+| `--quiet, -q` | Errors only. |
+| `--log, -l PATH` | Also write logs to a file. |
+| `--dry-run` | Validate and plan without changing anything. |
+| `--json` | Machine-readable output where supported. |
+
+Frequently needed subcommand options:
+
+| Command | Options |
+| --- | --- |
+| `create` | `--all` / `--core` / `--snakemake` / `--extra` / `--name` + `--yaml`; `--force` replaces an existing environment; `--clean-cache` clears the package cache afterwards; `--with <SPEC>` (repeatable) installs extra MatchSpecs right after creation; `--output stream\|summary\|quiet` controls solver logging. |
+| `run` | `enva run <env> -- <command>`; `--script FILE` runs a script instead; `--cwd DIR` sets the working directory; `--env/-E KEY=VALUE` (repeatable) adds environment variables; `--no-capture` streams tool output directly. |
+| `activate`/`deactivate` | `--shell bash\|zsh\|fish\|powershell`, `--prefix PATH`, `--pm` for the compatibility package manager. |
+| `remove` | Accepts multiple environment names in one invocation. |
+
+`enva-bench` (a separate binary in this crate) benchmarks create/solve paths.
+
 ## Compatibility model
 
 | Operation | Native rattler | Explicit compatibility path |
@@ -84,7 +111,7 @@ Equivalent one-shot activation is available through `eval "$(enva activate otter
 | YAML validation | Native solve | Basic delegated validation |
 | Install/remove | Rattler-owned prefixes | Adopted/external prefixes only |
 | Discover/list/run | Native registry | conda/mamba/micromamba discovery |
-| Adopt external prefix | Yes | Unsupported |
+| Adopt external prefix | Supported (`enva adopt` records it in the native registry) | Not delegated to the external package manager |
 
 Important rules:
 

@@ -2258,8 +2258,8 @@ mod tests {
     use crate::backend::{
         EnvironmentBackend, EnvironmentTarget, OutputMode, RunCommand, RunRequest,
     };
-    use crate::ownership::write_rattler_ownership_record;
     use crate::error::EnvError;
+    use crate::ownership::write_rattler_ownership_record;
     use crate::package_manager::PackageManager;
     use crate::prefix_registry::{DiscoveredEnvironment, EnvironmentOwner, EnvironmentSource};
     use rattler_conda_types::{PackageName, PackageRecord, PrefixRecord, RepoDataRecord, Version};
@@ -2626,7 +2626,8 @@ mod tests {
         let backend = backend_with_root(&root);
 
         let target_prefix = backend.target_prefix_for_env_name("test-env").unwrap();
-        assert_eq!(target_prefix, root.join("envs").join("test-env"));
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        assert_eq!(target_prefix, canonical_root.join("envs").join("test-env"));
     }
 
     #[test]
@@ -2641,7 +2642,11 @@ mod tests {
         let resolved = RattlerBackend::canonical_or_absolute(&missing).unwrap();
         assert_eq!(
             resolved,
-            fs::canonicalize(&existing).unwrap().join("a").join("b").join("c")
+            fs::canonicalize(&existing)
+                .unwrap()
+                .join("a")
+                .join("b")
+                .join("c")
         );
     }
 
