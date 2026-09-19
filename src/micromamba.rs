@@ -1403,7 +1403,7 @@ impl MicromambaManager {
     ) -> Result<()> {
         if !self.environment_exists(env_name).await? {
             return Err(EnvError::Execution(format!(
-                "Environment '{}' does not exist. Please create it first using 'xdxtools env create --name {}'",
+                "Environment '{}' does not exist. Please create it first using 'enva create --name {}'",
                 env_name,
                 env_name
             )));
